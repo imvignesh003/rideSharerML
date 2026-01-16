@@ -366,14 +366,14 @@ class NextHourRequest(BaseModel):
 
 
 class EtaRequest(NextHourRequest):
-    h3_index: str
     eta_datetime: str
 
 
-class EtaWithAnchorsRequest(EtaRequest):
-    historical_anchors: Dict[str, Optional[float]]
-    hist_avg: float
-    hist_var: float
+# class EtaWithAnchorsRequest(NextHourRequest):
+#     eta_datetime: str
+#     historical_anchors: Dict[str, Dict[str, Optional[float]]]
+#     hist_avg: Dict[str, float]
+#     hist_var: Dict[str, float]
 
 
 def build_features(req: NextHourRequest) -> np.ndarray:
@@ -456,28 +456,28 @@ def build_features(req: NextHourRequest) -> np.ndarray:
     return X
 
 
-def anchor_correction(base, anchors, hist_avg, hist_var):
-    values = []
-    weights = {
-        "yesterday_same_time": 0.35,
-        "last_week_same_day_time": 0.30,
-        "last_month_same_date_time": 0.20,
-        "last_year_same_date_time": 0.15
-    }
+# def anchor_correction(base, anchors, hist_avg, hist_var):
+#     values = []
+#     weights = {
+#         "yesterday_same_time": 0.35,
+#         "last_week_same_day_time": 0.30,
+#         "last_month_same_date_time": 0.20,
+#         "last_year_same_date_time": 0.15
+#     }
 
-    for k, w in weights.items():
-        if anchors.get(k) is not None:
-            values.append((anchors[k], w))
+#     for k, w in weights.items():
+#         if anchors.get(k) is not None:
+#             values.append((anchors[k], w))
 
-    if not values:
-        return base
+#     if not values:
+#         return base
 
-    y_anchor = sum(v * w for v, w in values) / sum(w for _, w in values)
+#     y_anchor = sum(v * w for v, w in values) / sum(w for _, w in values)
 
-    z = (y_anchor - hist_avg) / (math.sqrt(hist_var) + EPS)
-    alpha = 1 / (1 + math.exp(-(abs(z) - 0.75)))
+#     z = (y_anchor - hist_avg) / (math.sqrt(hist_var) + EPS)
+#     alpha = 1 / (1 + math.exp(-(abs(z) - 0.75)))
 
-    return (1 - alpha) * base + alpha * y_anchor
+#     return (1 - alpha) * base + alpha * y_anchor
 
 
 @app.get("/health")
@@ -523,10 +523,13 @@ def predict_next_hour(req: NextHourRequest):
 @app.post("/predict/eta")
 def predict_eta(req: EtaRequest):
     try:
-        if req.h3_index not in cell_to_idx:
-            raise HTTPException(400, "Invalid h3_index")
+        if len(req.timestamps) != WINDOW:
+            raise HTTPException(400, "timestamps must be length 12")
 
-        idx = cell_to_idx[req.h3_index]
+        missing = [h for h in cells if h not in req.history]
+        if missing:
+            raise HTTPException(400, f"Missing cells: {missing[:5]}")
+            
         X_np = build_features(req)
         X = torch.tensor(X_np).unsqueeze(0).to(DEVICE)
 
@@ -535,12 +538,25 @@ def predict_eta(req: EtaRequest):
         ).unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
-            pred = model(X, ADJ_TENSOR, eta)[0, idx, 0].item()
+            preds = model(X, ADJ_TENSOR, eta)[0].cpu().numpy()
+        
+        # Calculate scaling factor based on recent historical data
+        # Average pickup demand from the last few hours
+        recent_avg = np.mean([req.history[h].pickup[-3:] for h in cells], axis=1)
+        
+        # Scale predictions proportionally
+        SCALING_FACTOR = 150  # Start with this, tune based on results
+        # Or use adaptive scaling:
+        # scaling_factor = np.mean(recent_avg) / (np.mean(preds[:, 0]) + 1e-6)
+        
+        predictions = {}
+        for i, h3 in enumerate(cells):
+            scaled_pred = preds[i, 0] * SCALING_FACTOR
+            # Optional: blend with recent average for stability
+            final_pred = 0.7 * scaled_pred + 0.3 * recent_avg[i]
+            predictions[h3] = float(max(0, final_pred))
 
-        return {
-            "h3_index": req.h3_index,
-            "predicted_demand": round(pred, 4)
-        }
+        return {"predictions": predictions}
 
     except HTTPException:
         raise
@@ -550,41 +566,46 @@ def predict_eta(req: EtaRequest):
 
 
 
-@app.post("/predict/eta-with-history")
-def predict_eta_with_history(req: EtaWithAnchorsRequest):
-    try:
-        if req.h3_index not in cell_to_idx:
-            raise HTTPException(400, "Invalid h3_index")
+# @app.post("/predict/eta-with-history")
+# def predict_eta_with_history(req: EtaWithAnchorsRequest):
+#     try:
+#         # Build features from historical data
+#         X_np = build_features(req)
+#         X = torch.tensor(X_np).unsqueeze(0).to(DEVICE)
 
-        idx = cell_to_idx[req.h3_index]
+#         # Create temporal features for the ETA datetime
+#         eta = torch.tensor(
+#             temporal_features(datetime.fromisoformat(req.eta_datetime))
+#         ).unsqueeze(0).to(DEVICE)
 
-        X_np = build_features(req)
-        X = torch.tensor(X_np).unsqueeze(0).to(DEVICE)
+#         # Get base predictions for all nodes
+#         with torch.no_grad():
+#             base_preds = model(X, ADJ_TENSOR, eta)[0].cpu().numpy()  # Shape: (N, 1)
 
-        eta = torch.tensor(
-            temporal_features(datetime.fromisoformat(req.eta_datetime))
-        ).unsqueeze(0).to(DEVICE)
+#         # Apply anchor correction to all nodes
+#         predictions = {}
+#         for i, h3 in enumerate(cells):
+#             base_pred = base_preds[i, 0]
+            
+#             # Apply anchor correction for this node
+#             final_pred = anchor_correction(
+#                 base_pred,
+#                 req.historical_anchors.get(h3, {}),  # Get anchors for this specific node
+#                 req.hist_avg.get(h3, hist_avg[i, 0]),  # Get hist_avg for this node
+#                 req.hist_var.get(h3, hist_var[i, 0])   # Get hist_var for this node
+#             )
+            
+#             predictions[h3] = round(final_pred, 4)
 
-        with torch.no_grad():
-            base_pred = model(X, ADJ_TENSOR, eta)[0, idx, 0].item()
+#         return {
+#             "predictions": predictions
+#         }
 
-        final_pred = anchor_correction(
-            base_pred,
-            req.historical_anchors,
-            req.hist_avg,
-            req.hist_var
-        )
-
-        return {
-            "h3_index": req.h3_index,
-            "predicted_demand": round(final_pred, 4)
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("ETA+history inference error:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         print("ETA+history inference error:", e)
+#         raise HTTPException(status_code=500, detail=str(e))
 
     
 
