@@ -2,17 +2,120 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 from datetime import datetime
+from dateutil import parser
 import math
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+import h3
 import uvicorn
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 EPS = 1e-6
+WINDOW = 12
+NUM_CITY_CENTERS = 100
 
+MIN_LAT, MAX_LAT = 12.8500, 13.2500
+MIN_LON, MAX_LON = 79.9500, 80.3500
+H3_RESOLUTION = 8
+
+geojson_polygon = {
+    "type": "Polygon",
+    "coordinates": [[
+        [MIN_LON, MIN_LAT],
+        [MIN_LON, MAX_LAT],
+        [MAX_LON, MAX_LAT],
+        [MAX_LON, MIN_LAT],
+        [MIN_LON, MIN_LAT]
+    ]]
+}
+
+cells = sorted(list(h3.geo_to_cells(geojson_polygon, H3_RESOLUTION)))
+cell_to_idx = {c: i for i, c in enumerate(cells)}
+idx_to_cell = {i: c for c, i in cell_to_idx.items()}
+N = len(cells)
+
+adj = np.zeros((N, N), dtype=np.float32)
+for c in cells:
+    i = cell_to_idx[c]
+    for nbr in h3.grid_ring(c, 1):
+        if nbr in cell_to_idx:
+            j = cell_to_idx[nbr]
+            adj[i, j] = 1
+            adj[j, i] = 1
+np.fill_diagonal(adj, 1)
+
+def normalize_adj(A):
+    D = np.diag(1.0 / np.sqrt(A.sum(axis=1) + EPS))
+    return D @ A @ D
+
+ADJ = normalize_adj(adj)
+ADJ_TENSOR = torch.tensor(ADJ, dtype=torch.float32, device=DEVICE)
+
+print(f"Graph initialized with {N} nodes")
+
+random.seed(42)
+np.random.seed(42)
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2 +
+        math.cos(math.radians(lat1)) *
+        math.cos(math.radians(lat2)) *
+        math.sin(dlon / 2) ** 2
+    )
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+city_center_cells = set(random.sample(cells, NUM_CITY_CENTERS))
+city_centers_latlon = [h3.cell_to_latlng(c) for c in city_center_cells]
+
+
+distance_to_city_center = np.zeros((N, 1), dtype=np.float32)
+
+for i, cell in enumerate(cells):
+    lat, lon = h3.cell_to_latlng(cell)
+    min_dist = float("inf")
+    for clat, clon in city_centers_latlon:
+        d = haversine_km(lat, lon, clat, clon)
+        if d < min_dist:
+            min_dist = d
+    distance_to_city_center[i, 0] = min_dist
+
+
+is_commercial_area = (
+    np.exp(-distance_to_city_center / 5.0) >
+    np.random.rand(N, 1)
+).astype(np.float32)
+
+is_residential_area = (
+    np.exp(-distance_to_city_center / 12.0) >
+    np.random.rand(N, 1)
+).astype(np.float32)
+
+is_near_transit_hub = (
+    np.random.rand(N, 1) < 0.08
+).astype(np.float32)
+
+static_features = np.concatenate(
+    [
+        distance_to_city_center,  # 0
+        is_commercial_area,       # 1
+        is_residential_area,      # 2
+        is_near_transit_hub       # 3
+    ],
+    axis=1
+).astype(np.float32)
+
+hist_avg = np.random.uniform(2.0, 5.0, size=(N, 1)).astype(np.float32)
+hist_p90 = hist_avg * np.random.uniform(1.3, 1.6, size=(N, 1)).astype(np.float32)
+hist_var = np.random.uniform(0.5, 2.0, size=(N, 1)).astype(np.float32)
 
 class GraphConvolution(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
@@ -249,16 +352,20 @@ WINDOW = 12
 app = FastAPI(title="STGNN Demand Inference API")
 
 
+class NodeHistory(BaseModel):
+    search: List[float]
+    booking: List[float]
+    completed: List[float]
+    pickup: List[float]
+    dropoff: List[float]
+
 class NextHourRequest(BaseModel):
-    h3_indexes: List[str]
-    pickup_history: Dict[str, List[float]]
-    adjacency: List[List[float]]
+    timestamps: List[str]                 
+    history: Dict[str, NodeHistory]
 
 
-class EtaRequest(BaseModel):
-    h3_indexes: List[str]
-    pickup_history: Dict[str, List[float]]
-    adjacency: List[List[float]]
+
+class EtaRequest(NextHourRequest):
     h3_index: str
     eta_datetime: str
 
@@ -267,6 +374,86 @@ class EtaWithAnchorsRequest(EtaRequest):
     historical_anchors: Dict[str, Optional[float]]
     hist_avg: float
     hist_var: float
+
+
+def build_features(req: NextHourRequest) -> np.ndarray:
+    times = [parser.isoparse(t) for t in req.timestamps]
+
+    search = np.stack([req.history[h].search for h in cells])
+    booking = np.stack([req.history[h].booking for h in cells])
+    completed = np.stack([req.history[h].completed for h in cells])
+    pickup = np.stack([req.history[h].pickup for h in cells])
+    dropoff = np.stack([req.history[h].dropoff for h in cells])
+
+    def diff(x):
+        return np.diff(x, axis=1, prepend=x[:, :1])
+
+    def ma3(x):
+        y = np.zeros_like(x)
+        for t in range(WINDOW):
+            if t < 2:
+                y[:, t] = x[:, t]
+            else:
+                y[:, t] = (x[:, t] + x[:, t-1] + x[:, t-2]) / 3
+        return y
+
+    search_vel = diff(search)
+    booking_vel = diff(booking)
+    pickup_vel = diff(pickup)
+    dropoff_vel = diff(dropoff)
+
+    search_acc = diff(search_vel)
+    booking_acc = diff(booking_vel)
+
+    search_ma = ma3(search)
+    booking_ma = ma3(booking)
+    pickup_ma = ma3(pickup)
+
+    search_to_booking = booking / (search + EPS)
+    booking_to_pickup = pickup / (booking + EPS)
+
+    current_vs_hist = pickup / (hist_avg + EPS)
+
+    neighbor_search = ADJ @ search
+    neighbor_booking = ADJ @ booking
+    neighbor_dropoff = ADJ @ dropoff
+    distance_weighted = neighbor_search / (ADJ.sum(axis=1, keepdims=True) + 1)
+
+    hour_sin = np.tile([math.sin(2*math.pi*t.hour/24) for t in times], (N, 1))
+    hour_cos = np.tile([math.cos(2*math.pi*t.hour/24) for t in times], (N, 1))
+    dow_sin = np.tile([math.sin(2*math.pi*t.weekday()/7) for t in times], (N, 1))
+    dow_cos = np.tile([math.cos(2*math.pi*t.weekday()/7) for t in times], (N, 1))
+    is_weekend = np.tile([float(t.weekday() >= 5) for t in times], (N, 1))
+    is_holiday = np.zeros((N, WINDOW), dtype=np.float32)
+    event_flags = np.zeros((N, WINDOW), dtype=np.float32)
+
+    static_0 = np.tile(static_features[:, 0:1], (1, WINDOW))
+    static_1 = np.tile(static_features[:, 1:2], (1, WINDOW))
+    static_2 = np.tile(static_features[:, 2:3], (1, WINDOW))
+    static_3 = np.tile(static_features[:, 3:4], (1, WINDOW))
+
+    hist_avg_t = np.tile(hist_avg, (1, WINDOW))
+    hist_p90_t = np.tile(hist_p90, (1, WINDOW))
+    hist_var_t = np.tile(hist_var, (1, WINDOW))
+
+    features = [
+        search, booking, completed, dropoff, pickup,
+        search_to_booking, booking_to_pickup,
+        search_vel, booking_vel, pickup_vel, dropoff_vel,
+        search_acc, booking_acc,
+        search_ma, booking_ma, pickup_ma,
+        neighbor_search, neighbor_booking, neighbor_dropoff,
+        distance_weighted,
+        hour_sin, hour_cos, dow_sin, dow_cos,
+        is_weekend, is_holiday, event_flags,
+        static_0, static_1, static_2, static_3,
+        hist_avg_t, hist_p90_t, hist_var_t,
+        current_vs_hist
+    ]
+
+    X = np.stack(features, axis=2).astype(np.float32)
+    assert X.shape == (N, WINDOW, 35)
+    return X
 
 
 def anchor_correction(base, anchors, hist_avg, hist_var):
@@ -300,66 +487,86 @@ def health():
 @app.post("/predict/next-hour")
 def predict_next_hour(req: NextHourRequest):
     try:
-        h3_to_idx = {h: i for i, h in enumerate(req.h3_indexes)}
-        pickup = np.stack([req.pickup_history[h] for h in req.h3_indexes])
-        x = pickup[:, -WINDOW:][..., None]
+        # print(req)
+        if len(req.timestamps) != WINDOW:
+               raise HTTPException(400, "timestamps must be length 12")
 
-        X = torch.tensor(x).unsqueeze(0).to(DEVICE)
-        A = torch.tensor(req.adjacency, dtype=torch.float32).to(DEVICE)
+        missing = [h for h in cells if h not in req.history]
+        if missing:
+            raise HTTPException(400, f"Missing cells: {missing[:5]}")
+
+        X_np = build_features(req)
+        X = torch.tensor(X_np).unsqueeze(0).to(DEVICE)
+
+        print("MODEL expects in_features =", model.in_features)
+        print("ACTUAL input features =", X.shape[-1])
 
         with torch.no_grad():
-            preds = model(X, A)[0].cpu().numpy()
+            preds = model(X, ADJ_TENSOR)[0].cpu().numpy()
 
         return {
             "predictions": {
-                h3: preds[h3_to_idx[h3]].tolist()
-                for h3 in req.h3_indexes
+                h3: preds[i].tolist()
+                for i, h3 in enumerate(cells)
             }
         }
 
+
+    except HTTPException:
+        raise
     except Exception as e:
+        print("Inference error:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/predict/eta")
 def predict_eta(req: EtaRequest):
     try:
-        idx = req.h3_indexes.index(req.h3_index)
-        pickup = np.stack([req.pickup_history[h] for h in req.h3_indexes])
-        x = pickup[:, -WINDOW:][..., None]
+        if req.h3_index not in cell_to_idx:
+            raise HTTPException(400, "Invalid h3_index")
+
+        idx = cell_to_idx[req.h3_index]
+        X_np = build_features(req)
+        X = torch.tensor(X_np).unsqueeze(0).to(DEVICE)
 
         eta = torch.tensor(
             temporal_features(datetime.fromisoformat(req.eta_datetime))
         ).unsqueeze(0).to(DEVICE)
 
-        X = torch.tensor(x).unsqueeze(0).to(DEVICE)
-        A = torch.tensor(req.adjacency, dtype=torch.float32).to(DEVICE)
-
         with torch.no_grad():
-            pred = model(X, A, eta)[0, idx, 0].item()
+            pred = model(X, ADJ_TENSOR, eta)[0, idx, 0].item()
 
-        return {"h3_index": req.h3_index, "predicted_demand": round(pred, 4)}
+        return {
+            "h3_index": req.h3_index,
+            "predicted_demand": round(pred, 4)
+        }
 
+    except HTTPException:
+        raise
     except Exception as e:
+        print("ETA inference error:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/predict/eta-with-history")
 def predict_eta_with_history(req: EtaWithAnchorsRequest):
     try:
-        idx = req.h3_indexes.index(req.h3_index)
-        pickup = np.stack([req.pickup_history[h] for h in req.h3_indexes])
-        x = pickup[:, -WINDOW:][..., None]
+        if req.h3_index not in cell_to_idx:
+            raise HTTPException(400, "Invalid h3_index")
+
+        idx = cell_to_idx[req.h3_index]
+
+        X_np = build_features(req)
+        X = torch.tensor(X_np).unsqueeze(0).to(DEVICE)
 
         eta = torch.tensor(
             temporal_features(datetime.fromisoformat(req.eta_datetime))
         ).unsqueeze(0).to(DEVICE)
 
-        X = torch.tensor(x).unsqueeze(0).to(DEVICE)
-        A = torch.tensor(req.adjacency, dtype=torch.float32).to(DEVICE)
-
         with torch.no_grad():
-            base_pred = model(X, A, eta)[0, idx, 0].item()
+            base_pred = model(X, ADJ_TENSOR, eta)[0, idx, 0].item()
 
         final_pred = anchor_correction(
             base_pred,
@@ -373,8 +580,20 @@ def predict_eta_with_history(req: EtaWithAnchorsRequest):
             "predicted_demand": round(final_pred, 4)
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
+        print("ETA+history inference error:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+    
+
+
+
+
+
+
+
 
 
 if __name__ == "__main__":
