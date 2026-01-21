@@ -540,19 +540,13 @@ def predict_eta(req: EtaRequest):
         with torch.no_grad():
             preds = model(X, ADJ_TENSOR, eta)[0].cpu().numpy()
         
-        # Calculate scaling factor based on recent historical data
-        # Average pickup demand from the last few hours
         recent_avg = np.mean([req.history[h].pickup[-3:] for h in cells], axis=1)
         
-        # Scale predictions proportionally
-        SCALING_FACTOR = 150  # Start with this, tune based on results
-        # Or use adaptive scaling:
-        # scaling_factor = np.mean(recent_avg) / (np.mean(preds[:, 0]) + 1e-6)
+        SCALING_FACTOR = 150 
         
         predictions = {}
         for i, h3 in enumerate(cells):
             scaled_pred = preds[i, 0] * SCALING_FACTOR
-            # Optional: blend with recent average for stability
             final_pred = 0.7 * scaled_pred + 0.3 * recent_avg[i]
             predictions[h3] = float(max(0, final_pred))
 
